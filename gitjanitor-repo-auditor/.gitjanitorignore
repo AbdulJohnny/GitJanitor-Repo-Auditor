@@ -1,0 +1,8 @@
+# GitJanitor's own suppression list.
+# These files intentionally contain fake secret strings as test fixtures or
+# documentation examples, so we exclude them from self-scans / CI.
+create_mock_repo.py
+README.md
+INTERVIEW_STUDY_GUIDE.md
+test_dirty_repo/*
+reports/*

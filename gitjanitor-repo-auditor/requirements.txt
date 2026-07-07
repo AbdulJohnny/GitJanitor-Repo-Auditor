@@ -1,0 +1,2 @@
+# Dashboard dependency. The CLI (gitjanitor.py) needs only the Python standard library.
+streamlit>=1.30

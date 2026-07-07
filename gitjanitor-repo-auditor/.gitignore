@@ -1,0 +1,28 @@
+# Python
+node_modules/
+__pycache__/
+*.pyc
+*.py[cod]
+*.egg-info/
+.eggs/
+build/
+dist/
+
+# Virtual environments
+.venv/
+venv/
+env/
+
+# GitJanitor runtime artifacts
+test_dirty_repo/
+reports/
+
+# IDE / editor
+.idea/
+.vscode/
+*.swp
+.DS_Store
+
+# Environment / secrets / logs
+.env
+*.log
