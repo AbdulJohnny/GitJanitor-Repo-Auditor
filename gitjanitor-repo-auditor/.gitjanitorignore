@@ -4,5 +4,6 @@
 create_mock_repo.py
 README.md
 INTERVIEW_STUDY_GUIDE.md
+test_scanner.py
 test_dirty_repo/*
 reports/*

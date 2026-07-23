@@ -41,6 +41,19 @@ _ICON = {"Critical": "[CRIT]", "High": "[HIGH]", "Medium": "[MED ]",
 _ORDER = {"none": 0, "low": 1, "medium": 2, "high": 3, "critical": 4}
 
 
+def _force_utf8_output() -> None:
+    """Emit UTF-8 on our own streams so the ≥ / — / • glyphs we print don't turn
+    to mojibake when stdout/stderr is piped or captured. Windows defaults piped
+    streams to a legacy code page (e.g. cp1252) that can't encode them; a real
+    interactive console already handles Unicode, so this only helps the CI /
+    redirected case, which is exactly where it was breaking."""
+    for stream in (sys.stdout, sys.stderr):
+        try:
+            stream.reconfigure(encoding="utf-8", errors="replace")  # type: ignore[union-attr]
+        except (AttributeError, ValueError):
+            pass
+
+
 def _sev_order(band: str) -> int:
     return _ORDER.get(band.lower(), 0)
 
@@ -71,6 +84,8 @@ def print_report(label: str, report: sc.ScanReport) -> None:
         section("Secrets (git history):", [
             f"{_ICON[h.severity]} {h.score:>4}  {h.commit} {h.file}  {h.label} -> {h.preview}"
             for h in report.history])
+        if report.history_truncated:
+            print("  (history truncated at the commit cap — raise --max-commits for full coverage)")
 
     section("Prohibited files:", [
         f"{_ICON[sc.BANDS['prohibited_pii' if k == 'pii' else 'prohibited_secret']]} "
@@ -104,6 +119,7 @@ def save_report(row: dict) -> Path:
 
 
 def main(argv: list[str] | None = None) -> int:
+    _force_utf8_output()
     parser = argparse.ArgumentParser(
         prog="gitjanitor",
         description="CVSS-scored repository hygiene scanner (CLI / pre-commit gate).")
@@ -161,9 +177,12 @@ def main(argv: list[str] | None = None) -> int:
 
         report = sc.scan_repository(repo, threshold_bytes, detect_entropy=entropy)
         if args.history:
-            report.history = sc.scan_history_for_secrets(repo, detect_entropy=entropy,
-                                                         max_commits=args.max_commits)
+            res = sc.scan_history_for_secrets(repo, detect_entropy=entropy,
+                                              max_commits=args.max_commits)
+            report.history = res.findings
             report.history_scanned = True
+            report.history_truncated = res.truncated
+            report.suppressed += res.suppressed
     finally:
         if temp_clone is not None:
             shutil.rmtree(temp_clone, ignore_errors=True)
