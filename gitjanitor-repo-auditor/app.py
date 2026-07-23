@@ -71,6 +71,9 @@ def render_report_sections(report: sc.ScanReport, threshold_mb: int) -> None:
                         f"— **{h.label}** → `{h.preview}`")
     else:
         st.success("No secrets found in scanned commit history.")
+    if report.history_scanned and report.history_truncated:
+        st.caption("⚠️ History was truncated at the commit cap — older commits were not scanned. "
+                   "Raise the cap for full coverage.")
     st.divider()
 
     # 3. prohibited files
@@ -125,8 +128,11 @@ def render_report_sections(report: sc.ScanReport, threshold_mb: int) -> None:
 def run_single_scan(repo: Path, history: bool, entropy: bool, threshold_bytes: int) -> sc.ScanReport:
     report = sc.scan_repository(repo, threshold_bytes, detect_entropy=entropy)
     if history:
-        report.history = sc.scan_history_for_secrets(repo, detect_entropy=entropy)
+        res = sc.scan_history_for_secrets(repo, detect_entropy=entropy)
+        report.history = res.findings
         report.history_scanned = True
+        report.history_truncated = res.truncated
+        report.suppressed += res.suppressed
     return report
 
 
@@ -278,8 +284,11 @@ else:
                 temp_clone = sc.clone_public_repo(url, deep=scan_history)
                 rep = sc.scan_repository(temp_clone, threshold_bytes, detect_entropy=detect_entropy)
                 if scan_history:
-                    rep.history = sc.scan_history_for_secrets(temp_clone, detect_entropy=detect_entropy)
+                    res = sc.scan_history_for_secrets(temp_clone, detect_entropy=detect_entropy)
+                    rep.history = res.findings
                     rep.history_scanned = True
+                    rep.history_truncated = res.truncated
+                    rep.suppressed += res.suppressed
                 rows.append(sc.report_to_row(url, rep))
                 reports.append((url, rep))
             except FileNotFoundError:
@@ -309,7 +318,7 @@ else:
         c4.metric("Worst grade", worst["grade"] if worst else "—")
 
         st.dataframe([{
-            "Repository": r["repo"].replace("https://github.com/", "").rstrip(".git"),
+            "Repository": sc.short_repo_label(r["repo"]),
             "Grade": r["grade"], "Top CVSS": r["risk_score"], "Risks": r["risks"],
             "Secrets": r["secrets"], "History": r["history"], "Prohibited": r["prohibited"],
             "Junk": r["junk"], "Bloat": r["bloat"],
@@ -326,7 +335,7 @@ else:
 
         st.subheader("Per-repository detail")
         for label, rep in reports:
-            title = label.replace("https://github.com/", "").rstrip(".git")
+            title = sc.short_repo_label(label)
             with st.expander(f"{_GRADE_COLOR.get(rep.grade,'')} {rep.grade} · {title} "
                              f"— {rep.total_risks} risk(s), top CVSS {rep.risk_score}"):
                 render_report_sections(rep, bloat_threshold_mb)

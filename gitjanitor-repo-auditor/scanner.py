@@ -24,6 +24,7 @@ import os
 import re
 import subprocess
 import tempfile
+import time
 from collections import Counter
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -98,6 +99,14 @@ SECRET_PATTERNS: list[tuple[str, re.Pattern, str]] = [
     ("Google API key", re.compile(r"\bAIza[A-Za-z0-9_\-]{35}\b"), "critical"),
     ("Twilio API key", re.compile(r"\bSK[0-9a-fA-F]{32}\b"), "high"),
     ("npm access token", re.compile(r"\bnpm_[A-Za-z0-9]{36}\b"), "critical"),
+    # OpenAI: legacy `sk-` + long alnum block (no hyphens → won't match hyphenated
+    # identifiers like `sk-button-primary-…`), or the newer `sk-proj-/svcacct-` forms.
+    ("OpenAI API key",
+     re.compile(r"\bsk-(?:proj|svcacct|admin)-[A-Za-z0-9_\-]{20,}\b|\bsk-[A-Za-z0-9]{32,}\b"), "critical"),
+    ("GitLab personal access token", re.compile(r"\bglpat-[A-Za-z0-9_\-]{20,}\b"), "critical"),
+    ("SendGrid API key", re.compile(r"\bSG\.[A-Za-z0-9_\-]{16,}\.[A-Za-z0-9_\-]{16,}\b"), "critical"),
+    ("Azure storage account key", re.compile(r"(?i)\bAccountKey=[A-Za-z0-9+/=]{40,}"), "critical"),
+    ("GitHub OAuth/app token", re.compile(r"\bgh[osru]_[A-Za-z0-9]{36}\b"), "critical"),
     ("JWT", re.compile(r"\beyJ[A-Za-z0-9_\-]{8,}\.eyJ[A-Za-z0-9_\-]{8,}\.[A-Za-z0-9_\-]{8,}\b"), "high"),
     ("DB connection URI with credentials",
      re.compile(r"(?i)\b(?:postgres|postgresql|mysql|mongodb)(?:\+srv)?://[^\s:@/]+:[^\s@/]+@"), "critical"),
@@ -297,6 +306,7 @@ class ScanReport:
     gitignore_missing: list[tuple[str, str]] = field(default_factory=list)
     history: list[HistoryFinding] = field(default_factory=list)
     history_scanned: bool = False
+    history_truncated: bool = False
     suppressed: int = 0
     total_bytes: int = 0
     files_scanned: int = 0
@@ -343,6 +353,15 @@ def human_size(num_bytes: int) -> str:
             return f"{size:,.1f} {unit}" if unit != "B" else f"{int(size)} B"
         size /= 1024
     return f"{num_bytes} B"
+
+
+def short_repo_label(label: str) -> str:
+    """Human-friendly repo label: drop the github.com prefix and a trailing '.git'.
+
+    Uses str.removesuffix — NOT str.rstrip('.git'), which strips any trailing
+    '.', 'g', 'i', 't' *characters* and would mangle names (e.g. 'digit' -> 'd').
+    """
+    return label.replace("https://github.com/", "").removesuffix(".git")
 
 
 def redact(value: str) -> str:
@@ -602,9 +621,12 @@ def clone_public_repo(url: str, deep: bool = False) -> Path:
     """Clone into a fresh temp dir. deep=False → shallow (--depth 1). Caller cleans up."""
     dest = Path(tempfile.mkdtemp(prefix="gitjanitor_"))
     env = {**os.environ, "GIT_TERMINAL_PROMPT": "0"}
-    cmd = ["git", "clone", "--single-branch", _auth_url(url), str(dest)]
-    if not deep:
-        cmd[2:2] = ["--depth", "1"]
+    # Shallow single-branch for a tip-only scan; full clone of ALL branches when
+    # history is requested, so `git log --all` actually has every branch to scan.
+    if deep:
+        cmd = ["git", "clone", _auth_url(url), str(dest)]
+    else:
+        cmd = ["git", "clone", "--single-branch", "--depth", "1", _auth_url(url), str(dest)]
     try:
         subprocess.run(cmd, check=True, capture_output=True, text=True,
                        timeout=CLONE_TIMEOUT_SECONDS, env=env)
@@ -615,41 +637,82 @@ def clone_public_repo(url: str, deep: bool = False) -> Path:
     return dest
 
 
-def scan_history_for_secrets(repo: Path, detect_entropy: bool = True,
-                             max_commits: int = 2000) -> list[HistoryFinding]:
-    """Scan added lines of every past commit for secrets (the History Trap)."""
-    if not (repo / ".git").exists():
-        return []
-    try:
-        proc = subprocess.run(
-            ["git", "-C", str(repo), "log", "--all", "-p", "--no-color", "--no-merges",
-             f"--max-count={max_commits}", "--format=__COMMIT__%H"],
-            check=True, capture_output=True, text=True,
-            timeout=CLONE_TIMEOUT_SECONDS, errors="replace")
-    except (OSError, subprocess.SubprocessError):
-        return []
+@dataclass
+class HistoryScanResult:
+    findings: list[HistoryFinding] = field(default_factory=list)
+    commits_scanned: int = 0
+    truncated: bool = False   # hit the max_commits cap — older history not scanned
+    timed_out: bool = False   # wall-clock budget exhausted mid-stream
+    suppressed: int = 0       # findings dropped by .gitjanitorignore path globs
 
-    findings: list[HistoryFinding] = []
+
+def scan_history_for_secrets(repo: Path, detect_entropy: bool = True,
+                             max_commits: int = 2000,
+                             timeout: int = CLONE_TIMEOUT_SECONDS) -> HistoryScanResult:
+    """Scan added lines of every past commit for secrets (the History Trap).
+
+    Streams `git log -p` line by line instead of buffering the whole diff in
+    memory, so a repo with a large history won't blow up RAM. Enforces a
+    wall-clock budget and surfaces whether the commit cap was hit.
+    """
+    result = HistoryScanResult()
+    if not (repo / ".git").exists():
+        return result
+
+    # Honor .gitjanitorignore in history too, so a path excluded from the tree
+    # scan (e.g. test fixtures) doesn't resurface as a history finding.
+    suppress = load_suppressions(repo)
+
+    cmd = ["git", "-C", str(repo), "log", "--all", "-p", "--no-color", "--no-merges",
+           f"--max-count={max_commits}", "--format=__COMMIT__%H"]
+    try:
+        proc = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL,
+                                text=True, errors="replace", bufsize=1)
+    except (OSError, subprocess.SubprocessError):
+        return result
+
     seen: set[tuple[str, str, str]] = set()
     commit = ""
     current_file = "<unknown>"
-    for line in proc.stdout.splitlines():
-        if line.startswith("__COMMIT__"):
-            commit = line[len("__COMMIT__"):][:8]
-            continue
-        if line.startswith("+++ b/"):
-            current_file = line[6:]
-            continue
-        if not line.startswith("+") or line.startswith("+++"):
-            continue
-        line_entropy = detect_entropy and not _is_lockfile(Path(current_file).name)
-        for label, tier, evidence in scan_line_for_secrets(line[1:], line_entropy):
-            key = (commit, current_file, label)
-            if key in seen:
+    deadline = time.monotonic() + timeout
+    try:
+        for raw in proc.stdout:                      # type: ignore[union-attr]
+            if time.monotonic() > deadline:
+                result.timed_out = True
+                proc.kill()
+                break
+            line = raw.rstrip("\n")
+            if line.startswith("__COMMIT__"):
+                commit = line[len("__COMMIT__"):][:8]
+                current_file = "<unknown>"           # reset per commit for correct attribution
+                result.commits_scanned += 1
                 continue
-            seen.add(key)
-            findings.append(HistoryFinding(commit, current_file, label, redact(evidence), tier))
-    return findings
+            if line.startswith("+++ b/"):
+                current_file = line[6:]
+                continue
+            if not line.startswith("+") or line.startswith("+++"):
+                continue
+            line_entropy = detect_entropy and not _is_lockfile(Path(current_file).name)
+            for label, tier, evidence in scan_line_for_secrets(line[1:], line_entropy):
+                key = (commit, current_file, label)
+                if key in seen:
+                    continue
+                seen.add(key)
+                if suppress and is_suppressed(current_file, suppress):
+                    result.suppressed += 1
+                    continue
+                result.findings.append(
+                    HistoryFinding(commit, current_file, label, redact(evidence), tier))
+    finally:
+        if proc.stdout is not None:
+            proc.stdout.close()
+        try:
+            proc.wait(timeout=5)
+        except subprocess.SubprocessError:
+            proc.kill()
+
+    result.truncated = result.commits_scanned >= max_commits
+    return result
 
 
 def list_public_repos(owner: str, limit: int = 30) -> list[str]:
